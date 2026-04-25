@@ -1,0 +1,144 @@
+name: Grader
+
+on:
+  push:
+    branches-ignore:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  grade:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: latest
+
+      - name: Install dependencies
+        working-directory: starter-code
+        run: pnpm install --frozen-lockfile
+
+      # ── Métrica: cyclomatic_complexity ────────────────────────────────────
+      - name: Check cyclomatic complexity
+        id: complexity
+        working-directory: starter-code
+        run: |
+          npx --yes complexity-report --format json --output cr-report.json src/ 2>/dev/null || true
+
+          AVG_CC=$(node -e "
+            const fs = require('fs');
+            try {
+              const r = JSON.parse(fs.readFileSync('cr-report.json','utf8'));
+              const funcs = r.reports.flatMap(f => f.functions || []);
+              if (!funcs.length) { console.log('999'); return; }
+              const avg = funcs.reduce((s,f)=>s+(f.complexity?.cyclomatic||1),0)/funcs.length;
+              console.log(avg.toFixed(2));
+            } catch { console.log('999'); }
+          " 2>/dev/null || echo "999")
+
+          PASSED=$([ "$(echo "$AVG_CC <= 10" | bc -l)" -eq 1 ] && echo true || echo false)
+          SCORE=$([ "$PASSED" = "true" ] && echo "1.0" || echo "0.0")
+
+          echo "avg_cc=$AVG_CC" >> "$GITHUB_OUTPUT"
+          echo "score=$SCORE" >> "$GITHUB_OUTPUT"
+          echo "passed=$PASSED" >> "$GITHUB_OUTPUT"
+          echo "Avg CC: $AVG_CC (threshold: 10)"
+
+      # ── Métrica: code_duplication ─────────────────────────────────────────
+      - name: Check code duplication
+        id: duplication
+        working-directory: starter-code
+        run: |
+          npx --yes jscpd src/ --reporters json --output .jscpd 2>/dev/null || true
+
+          DUP_PCT=$(node -e "
+            const fs = require('fs');
+            try {
+              const r = JSON.parse(fs.readFileSync('.jscpd/jscpd-report.json','utf8'));
+              console.log((r.statistics.total.percentage || 0).toFixed(2));
+            } catch { console.log('0.00'); }
+          " 2>/dev/null || echo "0.00")
+
+          PASSED=$([ "$(echo "$DUP_PCT <= 3" | bc -l)" -eq 1 ] && echo true || echo false)
+          SCORE=$([ "$PASSED" = "true" ] && echo "1.0" || echo "0.0")
+
+          echo "duplication_pct=$DUP_PCT" >> "$GITHUB_OUTPUT"
+          echo "score=$SCORE" >> "$GITHUB_OUTPUT"
+          echo "passed=$PASSED" >> "$GITHUB_OUTPUT"
+          echo "Duplication: $DUP_PCT% (threshold: 3%)"
+
+      # ── Métrica: loc_delta ────────────────────────────────────────────────
+      - name: Check LOC delta
+        id: loc_delta
+        run: |
+          BASE="${{ github.event.pull_request.base.sha }}"
+
+          if [ -z "$BASE" ]; then
+            BASE=$(git rev-parse origin/main 2>/dev/null || git rev-parse HEAD~1)
+          fi
+
+          STATS=$(git diff --shortstat "$BASE"..HEAD -- 'starter-code/src/*.js' 2>/dev/null || echo "")
+
+          ADDED=$(echo "$STATS" | grep -oP '\d+(?= insertion)' || echo "0")
+          DELETED=$(echo "$STATS" | grep -oP '\d+(?= deletion)' || echo "0")
+          DELTA=$((ADDED - DELETED))
+
+          echo "loc_delta=$DELTA" >> "$GITHUB_OUTPUT"
+          PASSED=$([ "$DELTA" -le -50 ] && echo true || echo false)
+          SCORE=$([ "$PASSED" = "true" ] && echo "1.0" || echo "0.0")
+          echo "score=$SCORE" >> "$GITHUB_OUTPUT"
+          echo "passed=$PASSED" >> "$GITHUB_OUTPUT"
+          echo "LOC delta: $DELTA (need ≤ -50; added=$ADDED, deleted=$DELETED)"
+
+      # ── Reporte final ─────────────────────────────────────────────────────
+      - name: Build grader report
+        run: |
+          cat > grader-report.json << EOF
+          {
+            "schemaVersion": "1.0",
+            "templateSlug": "refactoring-basico",
+            "runId": "${{ github.run_id }}",
+            "sha": "${{ github.sha }}",
+            "metrics": [
+              {
+                "metricKey": "cyclomatic_complexity",
+                "score": ${{ steps.complexity.outputs.score }},
+                "passed": ${{ steps.complexity.outputs.passed }},
+                "unavailable": false,
+                "rawValue": ${{ steps.complexity.outputs.avg_cc }}
+              },
+              {
+                "metricKey": "code_duplication",
+                "score": ${{ steps.duplication.outputs.score }},
+                "passed": ${{ steps.duplication.outputs.passed }},
+                "unavailable": false,
+                "rawValue": ${{ steps.duplication.outputs.duplication_pct }}
+              },
+              {
+                "metricKey": "loc_delta",
+                "score": ${{ steps.loc_delta.outputs.score }},
+                "passed": ${{ steps.loc_delta.outputs.passed }},
+                "unavailable": false,
+                "rawValue": ${{ steps.loc_delta.outputs.loc_delta }}
+              }
+            ]
+          }
+          EOF
+          cat grader-report.json
+
+      - name: Upload grader report
+        uses: actions/upload-artifact@v4
+        with:
+          name: grader-report
+          path: grader-report.json
